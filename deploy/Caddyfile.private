@@ -1,0 +1,129 @@
+# ============================================================================
+# TrustAgent 私有演示模式的反向代理（默认启用这一份）
+#
+# 拓扑：
+#   浏览器 ──(SSH 隧道)──> 宿主机 127.0.0.1:8080 ──> Caddy 容器 ──┬──> /api/*      → backend:8080
+#                                                                ├──> 其它路径    → /srv（Vue 构建产物）
+#                                                                └──> /internal/* → 直接 404
+#
+# 为什么私有模式只监听 127.0.0.1：
+#   容器端口只绑到宿主机的回环地址，公网无法直连。访问方式是 SSH 本地端口转发，
+#   认证由 SSH 完成（密钥/口令），因此不需要在代理层再叠一套认证。
+#
+# 为什么不在这一层加 HTTP Basic 认证（重要）：
+#   本应用的接口用 `Authorization: Bearer <JWT>` 做认证，而 HTTP Basic 认证用的是
+#   **同一个** `Authorization` 请求头，两者会互相覆盖：浏览器发出的
+#   `Authorization: Basic ...` 会被前端 axios 显式设置的 `Authorization: Bearer ...`
+#   顶掉，代理随即判定未认证并返回 401，表现为"在弹框里输对了密码仍然登录不了"。
+#   要加访问控制应选**不争用 Authorization 头**的机制：IP 白名单（见 Caddyfile.public）
+#   或客户端证书（mTLS）。
+#
+# 语法提示：Caddyfile 的注释符号是 "#"，不是 "//"。
+# ============================================================================
+
+{
+	# 关闭 admin API：它默认监听 localhost:2019，等于一个"在线改配置"的入口。
+	# 本项目没有在线改配置的需求，关掉以缩小暴露面。
+	admin off
+
+	# 私有模式是纯 HTTP（仅回环地址可达），关闭自动 HTTPS，
+	# 否则 Caddy 会尝试为 IP 申请证书并反复失败、刷满日志。
+	auto_https off
+}
+
+# 只监听容器内 8080；宿主机侧的绑定方式是 127.0.0.1:8080（见 docker-compose.lowmem.yml）。
+# 这两个 "127.0.0.1" 缺一不可：只配容器内监听、而宿主机映射写成 "8080:8080"，
+# 就会把入口暴露到公网。
+:8080 {
+	# ---------------------------------------------------------------
+	# 安全响应头
+	# ---------------------------------------------------------------
+	header {
+		# 禁止浏览器按内容嗅探类型（防止把上传内容当脚本执行）
+		X-Content-Type-Options nosniff
+		# 不允许被任何页面用 iframe 嵌套（与下面的 CSP 双重保险）
+		X-Frame-Options DENY
+		# 跨站跳转时不携带完整来源
+		Referrer-Policy no-referrer
+		# 不暴露服务器软件信息
+		-Server
+
+		# 内容安全策略：**这里的 HTTP 头才是权威的那份**。
+		# 前端 index.html 里另有一个 <meta http-equiv="Content-Security-Policy">，
+		# 但 meta 形式的 CSP 不支持 frame-ancestors（浏览器会忽略该指令），
+		# 所以"禁止被嵌套"必须靠这个响应头。
+		#
+		#   script-src 'self'          —— 前端产物无内联脚本（已核对 web/dist/index.html），无需 unsafe-inline
+		#   style-src 'self' 'unsafe-inline' —— Element Plus 运行时注入内联样式，必须放开否则界面错乱
+		#   connect-src 'self'         —— 前端只访问同源 /api，不允许任何外部地址
+		#   object-src 'none'          —— 禁止 <object>/<embed>，本项目不使用
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+	}
+
+	# ---------------------------------------------------------------
+	# 内部接口：在代理层直接切断
+	#
+	# 服务端本身已有 InternalTokenFilter 做身份校验（缺失或不匹配一律 401），这里是更外面的一道。
+	# 两道都需要：
+	#   * 只靠代理层拦截 → 一旦有人绕过代理（例如容器端口被误发布到公网）就完全裸奔；
+	#   * 只靠服务端校验 → 公网上存在一个"拿着共享密钥就能访问"的端点，
+	#     密钥一旦泄露就等于内网可达，而这本该是"公网上根本不存在"的东西。
+	# 这就是"不能仅靠 URL 不公开"的落地方式：代理层显式 404，服务端仍然强制校验。
+	# ---------------------------------------------------------------
+	handle /internal/* {
+		respond "Not Found" 404
+	}
+
+	# ---------------------------------------------------------------
+	# 网关自身存活探针：不经过后端，用来区分"代理挂了"和"后端挂了"
+	# ---------------------------------------------------------------
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	# ---------------------------------------------------------------
+	# 控制面接口
+	# ---------------------------------------------------------------
+	handle /api/* {
+		reverse_proxy backend:8080 {
+			# 透传真实协议，便于后端拼绝对地址（报告导出接口会用到）
+			header_up X-Forwarded-Proto http
+		}
+	}
+
+	# 后端健康检查：冒烟脚本用它判断"整栈是否就绪"
+	handle /health {
+		reverse_proxy backend:8080
+	}
+
+	# OpenAPI 文档
+	# 私有模式（仅 SSH 隧道可达）保留，便于面试时展示接口设计；
+	# 公网模式下这几个路径必须拒绝，见 Caddyfile.public 的说明。
+	handle /swagger-ui* {
+		reverse_proxy backend:8080
+	}
+	handle /v3/api-docs* {
+		reverse_proxy backend:8080
+	}
+
+	# ---------------------------------------------------------------
+	# 其余路径一律当作前端静态资源
+	#
+	# 注意：这里服务的是**构建后的静态文件**，不是 Vite 开发服务器。
+	# 把 vite dev server 当部署入口的问题：单进程、无缓存头、默认开着 HMR 的
+	# WebSocket —— 那是开发工具，不是能给外部访问的服务。
+	# ---------------------------------------------------------------
+	handle {
+		root * /srv
+		# SPA 回退：Vue Router 使用 history 模式，直接刷新 /eval/runs/12 这类深层地址时
+		# 磁盘上并没有同名文件，必须回落到 index.html 交给前端路由，否则 404。
+		try_files {path} /index.html
+		file_server
+	}
+
+	# 访问日志：JSON 到 stdout，由 Docker 的 json-file 驱动轮转（见 compose 的 logging 段）
+	log {
+		output stdout
+		format json
+	}
+}

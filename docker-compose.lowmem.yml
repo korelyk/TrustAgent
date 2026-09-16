@@ -1,0 +1,429 @@
+# ============================================================================
+# TrustAgent 低配编排 —— 目标：在「1 核 2 GB」上跑完整的演示部署
+#
+# 与 docker-compose.yml 的关系：
+#   docker-compose.yml          = 默认/开发取向（端口绑 127.0.0.1、不设内存上限）
+#   docker-compose.lowmem.yml   = 演示部署取向（显式内存上限、内部服务完全不发布端口、
+#                                  日志轮转、独立 Worker、Caddy 网关）
+#   两者服务名一致，但**不要同时启动**（2 GB 机器跑不下两套）。
+#
+# 用法（在服务器上，详见 docs/DEPLOYMENT.md）：
+#   ./scripts/server/preflight.sh          # 先检查资源与端口
+#   ./scripts/server/deploy.sh             # 构建产物已上传的前提下发布
+#   ./scripts/server/status.sh             # 看内存/CPU/重启次数/端口绑定
+#
+# ---------------------------------------------------------------------------
+# 内存预算（合计 1536 MiB，宿主 2048 MiB，余量 512 MiB 给系统与 Docker）
+#
+#   backend     512 MiB
+#   mysql       512 MiB
+#   ai-service  192 MiB
+#   ai-worker   160 MiB    ← 独立进程，不与 ai-service 重复计算
+#   redis        96 MiB
+#   web(Caddy)   64 MiB
+#
+# ⚠️ 这是一份"初始调优预算"，不是已验证的最低需求。
+#    本机 Docker 引擎不可用（HCS_E_SERVICE_NOT_AVAILABLE），
+#    因此**这些上限没有在 1 核 2 GB 上实测过**。
+#    首次部署后必须用 status.sh 观察真实占用，并按 docs/DEPLOYMENT.md
+#    的「资源实测与调整」一节决定是否放宽或收紧。
+# ---------------------------------------------------------------------------
+#
+# 为什么 memswap_limit 与 mem_limit 相等：
+#   这等于"容器不允许使用 swap"。宿主若开了 swap，容器宁可被 OOMKill 也不要
+#   靠换页苟活——持续依赖 swap 的运行状态不是健康状态，只是把崩溃推迟到更难排查的时刻。
+#   注意本文件**不会**创建 swap（那不在这轮授权内）。
+# ============================================================================
+
+name: trustagent-demo
+
+# 所有服务共用同一份日志策略。
+# 为什么必须显式设置：Docker 的 json-file 驱动默认**不轮转**，
+# 一个日志刷屏的容器几天就能把 40 GB 磁盘写满，而磁盘满是本部署最直接的失败原因。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # MySQL 8：控制面的持久化存储（用户、应用、策略、评测结果、审计链）
+  # ---------------------------------------------------------------------------
+  mysql:
+    image: ${TRUSTAGENT_MYSQL_IMAGE:-mysql:8.4}
+    container_name: trustagent-mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: ${TRUSTAGENT_DB_ROOT_PASSWORD:?请在 .env 中设置 TRUSTAGENT_DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${TRUSTAGENT_DB_NAME:-trustagent}
+      # 应用账号**不是 root**：控制面只应拥有它需要的库权限。
+      # 用 root 连接应用会让"SQL 注入"与"运维便利"的边界完全消失。
+      MYSQL_USER: ${TRUSTAGENT_DB_USERNAME:?请在 .env 中设置 TRUSTAGENT_DB_USERNAME}
+      MYSQL_PASSWORD: ${TRUSTAGENT_DB_PASSWORD:?请在 .env 中设置 TRUSTAGENT_DB_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./deploy/mysql/conf.d:/etc/mysql/conf.d:ro
+    # 用 expose 而不是 ports：**不在宿主机上开任何端口**。
+    # 这一点很重要——见文件末尾的「端口暴露面」说明。
+    expose:
+      - "3306"
+    healthcheck:
+      # 用应用账号 ping，而不是 root：这样"能 ping 通"同时证明了应用账号可用，
+      # 否则会出现"MySQL 健康但应用连不上"的假绿灯。
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u\"$$MYSQL_USER\" -p\"$$MYSQL_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    restart: unless-stopped
+    mem_limit: 512m
+    memswap_limit: 512m
+    mem_swappiness: 0
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Redis 7：限流滑动窗口 + 评测任务 Streams（eval.jobs / eval.jobs.dlq）
+  # ---------------------------------------------------------------------------
+  redis:
+    image: ${TRUSTAGENT_REDIS_IMAGE:-redis:7.4-alpine}
+    container_name: trustagent-redis
+    environment:
+      REDIS_PASSWORD: ${TRUSTAGENT_REDIS_PASSWORD:?请在 .env 中设置 TRUSTAGENT_REDIS_PASSWORD}
+    # 通过挂载配置文件而不是拼命令行参数：noeviction / maxmemory / AOF 这些
+    # 决定"会不会静默丢任务"的设置，应该在一个可评审、可版本管理的文件里，
+    # 而不是散落在 compose 的一行字符串里。见 deploy/redis/redis-lowmem.conf。
+    #
+    # 必须用 sh -c 包一层（这是一个实测踩到的坑）：
+    #   compose 的 exec 形式（数组写法）**不经过 shell**，$$ 只会被 compose
+    #   转义成一个字面量的 $，没有 shell 会再展开它。
+    #   写成 exec 形式的后果是 Redis 的口令真的变成了字符串 "$REDIS_PASSWORD"，
+    #   表现为容器 running 但 healthcheck 永远 AUTH failed: WRONGPASS，
+    #   进而 compose 报 "dependency failed to start"，后面所有服务都起不来。
+    #   用 sh -c 才有 shell 去展开 $REDIS_PASSWORD。
+    command: ["sh", "-c", "exec redis-server /usr/local/etc/redis/redis.conf --requirepass \"$$REDIS_PASSWORD\""]
+    volumes:
+      - redis-data:/data
+      - ./deploy/redis/redis-lowmem.conf:/usr/local/etc/redis/redis.conf:ro
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+    mem_limit: 96m
+    memswap_limit: 96m
+    mem_swappiness: 0
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Python 执行面（FastAPI）：Agent 编排、输入/输出安检、工具策略校验
+  #
+  # 只提供 API。评测 Worker 是**另一个容器**（见下面的 ai-worker），
+  # 因此这里必须把 TRUSTAGENT_EVAL_WORKER_ENABLED 设为 false，
+  # 否则两个进程会同时消费同一个消费组——功能上能跑，但内存占用翻倍，
+  # 在 160 MiB 的预算里属于白扔。
+  # ---------------------------------------------------------------------------
+  ai-service:
+    # build 段是必须的：没有它时 compose 会认为该服务"无需构建"，
+    # 直接去找一个本地不存在的镜像 —— `docker compose build ai-service`
+    # 会以退出码 0 静默通过、不产出任何镜像，直到 up 阶段才报 "image not found"，
+    # 排查方向会被完全带偏。ai-worker 复用同一个镜像，因此它不需要 build。
+    build:
+      context: .
+      dockerfile: deploy/ai-service.Dockerfile
+    image: trustagent-ai-service:${TRUSTAGENT_IMAGE_TAG:?请设置 TRUSTAGENT_IMAGE_TAG（见 docs/DEPLOYMENT.md）}
+    container_name: trustagent-ai-service
+    environment:
+      TRUSTAGENT_INTERNAL_TOKEN: ${TRUSTAGENT_INTERNAL_TOKEN:?请在 .env 中设置 TRUSTAGENT_INTERNAL_TOKEN}
+      # 默认 Mock：确定性输出、不需要任何 API Key、不产生费用。
+      # 真实模型是**可选**的，且默认关闭——见下面 openai 相关变量的说明。
+      TRUSTAGENT_LLM_PROVIDER: ${TRUSTAGENT_LLM_PROVIDER:-mock}
+      TRUSTAGENT_LLM_MODEL: ${TRUSTAGENT_LLM_MODEL:-mock-llm-v1}
+      # 真实模型接入保持默认空值。
+      # 空值 = 走 Mock，不会发起任何外部请求。
+      TRUSTAGENT_OPENAI_BASE_URL: ${TRUSTAGENT_OPENAI_BASE_URL:-}
+      TRUSTAGENT_OPENAI_API_KEY: ${TRUSTAGENT_OPENAI_API_KEY:-}
+      TRUSTAGENT_JAVA_BASE_URL: http://backend:8080
+      TRUSTAGENT_REDIS_URL: redis://:${TRUSTAGENT_REDIS_PASSWORD}@redis:6379/0
+      # 评测 Worker 交给独立容器，这里关掉进程内那一份
+      TRUSTAGENT_EVAL_WORKER_ENABLED: "false"
+      TRUSTAGENT_LOG_LEVEL: ${TRUSTAGENT_LOG_LEVEL:-INFO}
+      # 执行面自身的兜底上限：即使控制面策略配错，也不会跑飞
+      TRUSTAGENT_HARD_MAX_INPUT_LENGTH: ${TRUSTAGENT_HARD_MAX_INPUT_LENGTH:-20000}
+      TRUSTAGENT_HARD_MAX_TOOL_CALLS: ${TRUSTAGENT_HARD_MAX_TOOL_CALLS:-10}
+      TRUSTAGENT_HARD_TASK_TIMEOUT_MS: ${TRUSTAGENT_HARD_TASK_TIMEOUT_MS:-60000}
+    # 覆盖 Dockerfile 的 CMD，加上并发上限。
+    # --limit-concurrency：同时在处理的请求数上限。默认（无限制）意味着
+    #   突发的并发请求会把内存顶上去，而 192 MiB 的容器没有余量接住它。
+    # --workers 1：单进程。多进程会各自加载一份编排器与检测器，内存线性增长。
+    command:
+      - python
+      - -m
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --workers
+      - "1"
+      - --limit-concurrency
+      - "20"
+      - --timeout-keep-alive
+      - "5"
+      - --no-server-header
+    expose:
+      - "8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+    restart: unless-stopped
+    mem_limit: 192m
+    memswap_limit: 192m
+    mem_swappiness: 0
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # 评测 Worker（独立进程）
+  #
+  # 为什么独立：评测是"批量、可慢、可重试"的负载，Agent 接口是"交互式、要快"的负载。
+  # 放在一个进程里，一次 100 条 × 双配置的评测会把 Agent 响应拖慢；
+  # 而 Worker 崩溃重启时，也会把 Agent 接口一起带下去。
+  # 拆开之后两者互不影响，代价是多一个 Python 进程（160 MiB）。
+  # ---------------------------------------------------------------------------
+  ai-worker:
+    image: trustagent-ai-service:${TRUSTAGENT_IMAGE_TAG:?请设置 TRUSTAGENT_IMAGE_TAG（见 docs/DEPLOYMENT.md）}
+    container_name: trustagent-ai-worker
+    environment:
+      TRUSTAGENT_INTERNAL_TOKEN: ${TRUSTAGENT_INTERNAL_TOKEN:?请在 .env 中设置 TRUSTAGENT_INTERNAL_TOKEN}
+      TRUSTAGENT_LLM_PROVIDER: ${TRUSTAGENT_LLM_PROVIDER:-mock}
+      TRUSTAGENT_LLM_MODEL: ${TRUSTAGENT_LLM_MODEL:-mock-llm-v1}
+      TRUSTAGENT_OPENAI_BASE_URL: ${TRUSTAGENT_OPENAI_BASE_URL:-}
+      TRUSTAGENT_OPENAI_API_KEY: ${TRUSTAGENT_OPENAI_API_KEY:-}
+      TRUSTAGENT_JAVA_BASE_URL: http://backend:8080
+      TRUSTAGENT_REDIS_URL: redis://:${TRUSTAGENT_REDIS_PASSWORD}@redis:6379/0
+      # 每批回传的用例数。默认 20；低配下调到 10：
+      # 批越小，单次回调的请求体越小、峰值内存越低，
+      # 代价是"中途挂掉时重跑的最后一批"更小——这里方向是对的。
+      TRUSTAGENT_EVAL_BATCH_SIZE: ${TRUSTAGENT_EVAL_BATCH_SIZE:-10}
+      TRUSTAGENT_EVAL_MAX_DELIVERIES: ${TRUSTAGENT_EVAL_MAX_DELIVERIES:-3}
+      TRUSTAGENT_EVAL_READ_BLOCK_MS: ${TRUSTAGENT_EVAL_READ_BLOCK_MS:-5000}
+      TRUSTAGENT_LOG_LEVEL: ${TRUSTAGENT_LOG_LEVEL:-INFO}
+    # 直接跑 Worker 模块（不是 uvicorn）：这是个后台消费者，没有 HTTP 端口。
+    command: ["python", "-m", "app.eval.worker"]
+    # 没有端口、也没有可靠的"活着即健康"探针：
+    # 一个卡在长任务里的 Worker 进程仍然是"running"。真正的健康判断要靠
+    # status.sh 去看 PEL 积压与最近一条日志，所以这里不写假的 healthcheck。
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    restart: unless-stopped
+    mem_limit: 160m
+    memswap_limit: 160m
+    mem_swappiness: 0
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Java 控制面
+  # ---------------------------------------------------------------------------
+  backend:
+    # 用「只组装、不编译」的 Dockerfile：
+    # 目标机器是 1 核 2 GB 且上面已经跑着别的项目，跑 Maven（峰值 1~1.5GB）
+    # 会与别人的服务抢内存。jar 由本地/CI 构建好，服务器只做 COPY。
+    # 详见 deploy/backend-runtime.Dockerfile 的文件头说明。
+    build:
+      context: .
+      dockerfile: deploy/backend-runtime.Dockerfile
+    image: trustagent-backend:${TRUSTAGENT_IMAGE_TAG:?请设置 TRUSTAGENT_IMAGE_TAG（见 docs/DEPLOYMENT.md）}
+    container_name: trustagent-backend
+    environment:
+      TRUSTAGENT_DB_URL: "jdbc:mysql://mysql:3306/${TRUSTAGENT_DB_NAME:-trustagent}?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC&allowPublicKeyRetrieval=true&useSSL=false"
+      TRUSTAGENT_DB_USERNAME: ${TRUSTAGENT_DB_USERNAME:?请在 .env 中设置 TRUSTAGENT_DB_USERNAME}
+      TRUSTAGENT_DB_PASSWORD: ${TRUSTAGENT_DB_PASSWORD:?请在 .env 中设置 TRUSTAGENT_DB_PASSWORD}
+      # 连接池同步缩小：每条 MySQL 连接在服务端都要占用内存，
+      # 10 条连接配 40 个 max_connections 是浪费。5 条足够单用户演示。
+      TRUSTAGENT_DB_POOL_MAX: ${TRUSTAGENT_DB_POOL_MAX:-5}
+      TRUSTAGENT_DB_POOL_MIN_IDLE: ${TRUSTAGENT_DB_POOL_MIN_IDLE:-1}
+      TRUSTAGENT_REDIS_HOST: redis
+      TRUSTAGENT_REDIS_PORT: "6379"
+      TRUSTAGENT_REDIS_PASSWORD: ${TRUSTAGENT_REDIS_PASSWORD:?请在 .env 中设置 TRUSTAGENT_REDIS_PASSWORD}
+      TRUSTAGENT_JWT_SECRET: ${TRUSTAGENT_JWT_SECRET:?请在 .env 中设置 TRUSTAGENT_JWT_SECRET（长度需 >= 32 字节）}
+      TRUSTAGENT_INTERNAL_TOKEN: ${TRUSTAGENT_INTERNAL_TOKEN:?请在 .env 中设置 TRUSTAGENT_INTERNAL_TOKEN}
+      TRUSTAGENT_AI_SERVICE_BASE_URL: http://ai-service:8000
+      TRUSTAGENT_AI_SERVICE_TIMEOUT_MS: ${TRUSTAGENT_AI_SERVICE_TIMEOUT_MS:-20000}
+      TRUSTAGENT_BOOTSTRAP_ADMIN_USERNAME: ${TRUSTAGENT_BOOTSTRAP_ADMIN_USERNAME:-}
+      TRUSTAGENT_BOOTSTRAP_ADMIN_PASSWORD: ${TRUSTAGENT_BOOTSTRAP_ADMIN_PASSWORD:-}
+      TRUSTAGENT_LOG_LEVEL: ${TRUSTAGENT_LOG_LEVEL:-INFO}
+      # Tomcat 线程数：默认 200 在单用户演示里是纯浪费
+      TRUSTAGENT_TOMCAT_MAX_THREADS: ${TRUSTAGENT_TOMCAT_MAX_THREADS:-25}
+      TRUSTAGENT_TOMCAT_MIN_SPARE: ${TRUSTAGENT_TOMCAT_MIN_SPARE:-5}
+      TRUSTAGENT_TOMCAT_MAX_CONNECTIONS: ${TRUSTAGENT_TOMCAT_MAX_CONNECTIONS:-100}
+      TRUSTAGENT_TOMCAT_ACCEPT_COUNT: ${TRUSTAGENT_TOMCAT_ACCEPT_COUNT:-50}
+      # 限流：评测提交是最容易被误触的"重操作"，额度压到最低
+      TRUSTAGENT_RL_EVAL_LIMIT: ${TRUSTAGENT_RL_EVAL_LIMIT:-3}
+      TRUSTAGENT_RL_CHAT_LIMIT: ${TRUSTAGENT_RL_CHAT_LIMIT:-20}
+      TRUSTAGENT_RL_LOGIN_LIMIT: ${TRUSTAGENT_RL_LOGIN_LIMIT:-10}
+      # 单份评测集的用例上限：低配下调到 200（一次 100 条 × 双配置刚好够用）
+      TRUSTAGENT_EVAL_MAX_CASES_PER_DATASET: ${TRUSTAGENT_EVAL_MAX_CASES_PER_DATASET:-200}
+      TRUSTAGENT_EVAL_JOB_TIMEOUT_SECONDS: ${TRUSTAGENT_EVAL_JOB_TIMEOUT_SECONDS:-900}
+      TRUSTAGENT_MAX_UPLOAD_SIZE: ${TRUSTAGENT_MAX_UPLOAD_SIZE:-2MB}
+      # ---------------------------------------------------------------------
+      # JVM 参数：**这里只允许有一个来源**（见 deploy/backend.Dockerfile 的说明）
+      #
+      # 512 MiB 的容器上限里，堆只能拿一半 —— 剩下的一半要装：
+      #   metaspace（类元数据）、code cache（JIT 产物）、直接内存（NIO）、
+      #   线程栈、GC 结构。把 512 MiB 全给堆的结果不是"跑得更快"，
+      #   而是容器在初始化阶段就被 OOMKilled，且报错信息完全指不到堆。
+      #
+      #   MaxRAMPercentage=50   → 堆约 256 MiB（容器上限由 mem_limit 提供，JDK 能识别 cgroup）
+      #   MaxMetaspaceSize=96m  → 上限而非预分配；Spring Boot 实测通常 70~90 MiB
+      #   ReservedCodeCacheSize=32m → 配合 TieredStopAtLevel=1，C1 编译产物更少
+      #   MaxDirectMemorySize=32m   → Spring 的 NIO/文件拷贝/报告导出会用到
+      #   ActiveProcessorCount=1    → 不让 JVM 按宿主核数去推算 GC/编译线程数
+      #   UseSerialGC               → 1 核 + 小堆场景下比 G1 更省内存、线程更少
+      #   TieredStopAtLevel=1       → 只用 C1 即时编译：启动更快、code cache 更省
+      #
+      # ⚠️ 这组值是按上述推理选的，**未在 1 核 2 GB 上实测**。
+      # ---------------------------------------------------------------------
+      JAVA_OPTS: >-
+        -XX:MaxRAMPercentage=50
+        -XX:MaxMetaspaceSize=96m
+        -XX:ReservedCodeCacheSize=32m
+        -XX:MaxDirectMemorySize=32m
+        -XX:ActiveProcessorCount=1
+        -XX:+UseSerialGC
+        -XX:TieredStopAtLevel=1
+        -Duser.timezone=UTC
+      TZ: UTC
+    expose:
+      - "8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ai-service:
+        condition: service_healthy
+    healthcheck:
+      # 打 /health 而不是只判断"进程在"：Spring 起来了但连不上数据库时，
+      # 进程依然是 running，那不叫健康。
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+    restart: unless-stopped
+    mem_limit: 512m
+    memswap_limit: 512m
+    mem_swappiness: 0
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # 前端 + 反向代理（Caddy）
+  #
+  # 这是**唯一**在宿主机上开端口的服务，且端口只绑回环地址。
+  # 公网无法直连；访问方式是从自己电脑建 SSH 隧道（见 docs/DEPLOYMENT.md）。
+  # ---------------------------------------------------------------------------
+  web:
+    # web 镜像同样只做组装：把本地已构建好的 web/dist 拷进 Caddy 镜像。
+    # 服务器上**不跑** npm install / vue-tsc / vite —— 那在 1 核 2 GB 上
+    # 峰值要吃 0.8~1.5GB 内存，且本机也没有 Node 环境的必要。
+    build:
+      context: .
+      dockerfile: deploy/web.Dockerfile
+    image: trustagent-web:${TRUSTAGENT_IMAGE_TAG:?请设置 TRUSTAGENT_IMAGE_TAG（见 docs/DEPLOYMENT.md）}
+    container_name: trustagent-web
+    # 公网 HTTPS 模式需要的两个变量：deploy/Caddyfile.public 里用的是
+    #   email {$TRUSTAGENT_ACME_EMAIL}  与  {$TRUSTAGENT_PUBLIC_DOMAIN} { ... }
+    # Caddy 的 {$VAR} 是**环境变量插值**，变量不存在时插值成空串，
+    # 于是 email 变成 "email"（缺参数）、站点块缺主机名 —— Caddy 会直接启动失败。
+    # 也就是说：以前照 Caddyfile.public 头部步骤切到公网模式，web 容器必然起不来，
+    # 而报错在容器日志里、看起来像 Caddyfile 写错。
+    #
+    # 现在统一在这里注入：私有模式（Caddyfile.private）**不使用**这两个变量，
+    # 默认值为空也不会导致任何解析问题，因此两种模式共用同一份 compose 都安全。
+    # 具体值仍然只在 .env 里配（私有模式留空即可）。
+    environment:
+      TRUSTAGENT_PUBLIC_DOMAIN: ${TRUSTAGENT_PUBLIC_DOMAIN:-}
+      TRUSTAGENT_ACME_EMAIL: ${TRUSTAGENT_ACME_EMAIL:-}
+    volumes:
+      # 只读挂载代理配置：切换"私有/公网"模式时改这一行即可，不需要重建镜像。
+      # 默认私有模式（仅 SSH 隧道可达）。
+      - ./deploy/Caddyfile.private:/etc/caddy/Caddyfile:ro
+      # 公网模式启用后才需要这两个卷（Caddy 存 ACME 证书与状态）
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      # 关键：左边必须是 127.0.0.1，不能是 0.0.0.0 或省略主机。
+      # 少写这个前缀 = 把入口暴露到公网，而 compose 文件上看起来"只是映射了一个端口"。
+      #
+      # 端口默认值与 docker-compose.yml（开发取向）、.env.example、init-server-env.sh
+      # 保持一致，都是 8090。四处默认值必须相同：
+      # 否则"照抄示例 .env"和"用 compose 默认值"会得到不同的访问地址，
+      # 表现为"文档写的地址打不开"，而排查方向完全被带偏。
+      - "127.0.0.1:${TRUSTAGENT_WEB_PORT:-8090}:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+    mem_limit: 64m
+    memswap_limit: 64m
+    mem_swappiness: 0
+    logging: *default-logging
+
+volumes:
+  mysql-data:
+  redis-data:
+  caddy-data:
+  caddy-config:
+
+# ============================================================================
+# 端口暴露面（这是本文件最重要的安全属性，请勿"顺手"改掉）
+#
+#   服务            宿主端口    说明
+#   ------------    --------    ------------------------------------------
+#   web             127.0.0.1:${TRUSTAGENT_WEB_PORT:-8090}   唯一入口，仅回环，走 SSH 隧道访问
+#   backend         无          用 expose，宿主不开端口
+#   ai-service      无          用 expose，宿主不开端口
+#   ai-worker       无          没有 HTTP 端口
+#   mysql           无          用 expose，宿主不开端口
+#   redis           无          用 expose，宿主不开端口
+#
+# 为什么用 expose 而不是 "127.0.0.1:3306:3306"：
+#   绑回环已经不会被公网直连，但仍然会在宿主机上开一个监听端口。
+#   一旦有人为了排障把它改成 0.0.0.0、或者宿主上跑了别的容器做端口转发，
+#   数据库就暴露了。"宿主上根本不监听"是比"绑定地址正确"更强的保证——
+#   它不依赖任何人后续不改配置。
+#
+# 需要人工访问数据库时（排障/备份校验）：
+#   docker compose -f docker-compose.lowmem.yml exec mysql \
+#       mysql -u"$TRUSTAGENT_DB_USERNAME" -p trustagent
+#   这条路径不经过网络，也就不会因为"临时开个端口"留下隐患。
+#
+# ⚠️ 不要依赖 UFW/安全组来"隔离 Docker 端口"：
+#   Docker 自己写 iptables 规则，经常绕过 UFW 的 INPUT 链，
+#   于是"ufw status 显示 3306 被拒绝"但实际仍可连通。
+#   真正的保证是"容器根本没在宿主上监听"——这就是上面用 expose 的原因。
+#   验收方式见 scripts/server/status.sh 的端口检查。
+# ============================================================================

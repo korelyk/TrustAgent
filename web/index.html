@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TrustAgent 管理端</title>
+    <!--
+      内容安全策略（CSP）：只允许同源资源与内联样式（Element Plus 需要）。
+      这是"前端不用 v-html 渲染模型输出"之外的第二道防线：
+      即使某处漏了转义，CSP 也能拦住内联脚本执行。
+      该 meta 的 content 由 vite.config.ts 的 cspPlugin 在构建时填入：
+      开发策略放行 ws:（HMR 需要），生产策略只允许 connect-src 'self'。
+      这样产物里不会残留 ws:，也与 deploy/Caddyfile.* 的响应头一致。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="__TRUSTAGENT_CSP__"
+    />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,58 @@
+# ============================================================================
+# docker build 上下文排除规则
+#
+# 为什么必须有这个文件：
+#   没有它时，docker CLI 会把**整个仓库**打包发给 daemon。本仓库里
+#   ai-service/.venv(≈50MB) + web/node_modules(≈129MB) + backend/target(≈49MB)
+#   合计约 230MB，每次 build 都要重传一遍；在 1 核 2 GB 的服务器上这既慢又占内存。
+#
+# 为什么 jar 不放在 backend/target 下让 Dockerfile 直接 COPY：
+#   那样就必须把 target/ 整个放进上下文（含 classes、test-classes 等一堆中间产物）。
+#   改为在构建前把 jar 复制到 deploy/artifacts/，就可以把 target/ 整体排除。
+# ============================================================================
+
+# ---- 依赖目录：服务器/CI 上会重新安装，不需要从上下文传 ----
+**/.venv/
+**/venv/
+**/node_modules/
+
+# ---- Java 构建中间产物 ----
+# 注意：deploy/artifacts/ 下的 jar 是**例外**，它必须进上下文（见上面的说明）。
+# 该目录在 .gitignore 里被忽略（本地构建产物，不入库），但那与 docker 上下文无关：
+# **不要**为了"和 .gitignore 保持一致"在这里排除它 —— 排除后 backend-runtime.Dockerfile
+# 的 COPY 会直接失败，低配部署就再也构建不出镜像了。
+backend/target/
+# 明确重申：以下路径必须保留在构建上下文中（写出来是为了防止后来者加规则时误伤）
+!deploy/artifacts/
+!deploy/artifacts/*.jar
+
+# ---- Git 与本地缓存 ----
+.git/
+.gitignore
+.local/
+.pytest_cache/
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+
+# ---- 镜像 tar：可达数 GB，绝不能进构建上下文 ----
+deploy/images/
+
+# ---- 密钥文件：绝不能进构建上下文 ----
+# 即使没有任何 Dockerfile 去 COPY 它，它也会被"发送"给 docker daemon；
+# 而 daemon 可能运行在与 CLI 不同的机器上（远程/CI），这属于无谓的密钥外传。
+.env
+.env.*
+!.env.example
+*.bak
+
+# ---- 运行时数据与日志 ----
+.data/
+*.log
+logs/
+outbox/
+
+# ---- 编辑器 ----
+.idea/
+.vscode/
+*.iml

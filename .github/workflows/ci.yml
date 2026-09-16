@@ -1,0 +1,185 @@
+# TrustAgent CI
+#
+# 三道测试：Java 控制面（H2 内存库，不需要外部服务）、Python 执行面（确定性 MockLLM）、
+# 前端构建（含类型检查）。
+#
+# 另外加了两条**项目特有的门禁**，因为它们对应的是这个项目的核心安全约定，
+# 靠人工 review 一定会漏：
+#   1. 仓库里不得出现真实密钥文件；
+#   2. 前端不得使用 v-html（模型输出只能以文本渲染）。
+#
+# 未包含：Docker 镜像构建与端到端联调（需要拉取 MySQL/Redis 镜像，耗时且占用配额），
+# 以及 k6 压测（按项目约定不自动执行）。
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ---------------------------------------------------------------- Java 控制面
+  backend:
+    name: Java 控制面测试
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      # 测试跑在 H2（MySQL 兼容模式）上，不需要 MySQL 与 Redis：
+      # application-test.yml 用的是内存限流与内存评测队列。
+      - name: 运行测试
+        run: ./mvnw -B test
+
+      - name: 打包（顺带验证 fat jar 可构建）
+        run: ./mvnw -B -DskipTests package
+
+      # H2 只用于 dev/test，绝不能进生产制品。这条断言把该约定变成可执行的检查。
+      - name: 断言生产 fat jar 中不含 H2
+        run: |
+          if unzip -l target/trustagent-backend-*.jar | grep -q 'BOOT-INF/lib/h2-'; then
+            echo "生产 fat jar 里出现了 H2 驱动，请检查 pom.xml 的 repackage excludes"
+            exit 1
+          fi
+
+      - name: 上传测试报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-surefire-reports
+          path: backend/target/surefire-reports/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- Python 执行面
+  ai-service:
+    name: Python 执行面测试
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ai-service
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: ai-service/requirements*.txt
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      # 全部测试都不依赖外部服务：不连 Redis、不连 MySQL、不联网、不加载模型。
+      - name: 运行测试
+        run: python -m pytest
+
+  # ---------------------------------------------------------------- 前端
+  web:
+    name: 前端构建与类型检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖
+        working-directory: web
+        run: npm ci
+
+      # build 里包含 vue-tsc 类型检查，因此这一步同时是"类型检查"和"构建"
+      - name: 构建
+        working-directory: web
+        run: npm run build
+
+  # ---------------------------------------------------------------- 安全门禁
+  guardrails:
+    name: 安全约定门禁
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 禁止真实密钥文件入库
+        run: |
+          set -e
+          # .env.example 是模板，允许；.env 及任何其它 env 文件都不允许
+          offenders=$(git ls-files | grep -E '(^|/)\.env($|\.)' | grep -v '\.env\.example$' || true)
+          if [ -n "$offenders" ]; then
+            echo "仓库里出现了疑似真实配置的文件："; echo "$offenders"; exit 1
+          fi
+          secret_files=$(git ls-files | grep -E '\.(pem|p12|jks|keystore|key)$' || true)
+          if [ -n "$secret_files" ]; then
+            echo "仓库里出现了密钥文件："; echo "$secret_files"; exit 1
+          fi
+          echo "未发现密钥文件"
+
+      - name: 禁止前端使用 v-html
+        run: |
+          set -e
+          # 模型输出与后端字符串只能以文本插值渲染。这是项目明确的安全约定：
+          # 输出侧虽然也会转义危险 HTML，但安全设计不能只依赖一道防线。
+          #
+          # 正则只匹配**真实用法**（v-html="x" / el.innerHTML = x / dangerouslySetInnerHTML:{...}），
+          # 不匹配裸词提及：源码里有若干注释与说明文字提到这些名字（安全约定的解释本身），
+          # 若按裸词匹配，门禁会被自己的注释判红，从而变成"必红门禁"——那种门禁最后一定会被人绕过。
+          PATTERN='(v-html[[:space:]]*=|\.innerHTML[[:space:]]*=|dangerouslySetInnerHTML[[:space:]]*[:=])'
+          if grep -rn --include='*.vue' --include='*.ts' --include='*.js' -E "$PATTERN" web/src 2>/dev/null; then
+            echo "前端出现了直接渲染不可信 HTML 的用法，请改为文本插值"
+            exit 1
+          fi
+          echo "前端未使用 v-html / innerHTML（只匹配真实用法，避免注释误伤）"
+
+      - name: 校验 docker-compose 语法
+        run: |
+          # 只做语法与变量插值校验，不拉镜像、不启动容器
+          cp .env.example .env
+          # compose 里用了 ${VAR:?...}，因此必须填入非空值才能通过校验。
+          #
+          # 正则里的 \r* 不是多余的：.env.example 在工作区里是 CRLF，行内容是 "KEY=\r"，
+          # 用 's/^KEY=$/' 永远匹配不到：\r 是行内容的一部分，$ 之前还隔着它。
+          # 结果是 5 个占位变量一个也填不上，compose 校验必然失败。
+          # .gitattributes 现在会把这些文件在检出时统一成 LF，但巡检脚本/旧工作区
+          # 仍可能拿到 CRLF，所以两处都做：容忍 \r 且把换行约定写进仓库。
+          sed -i 's/^TRUSTAGENT_JWT_SECRET=\r*$/TRUSTAGENT_JWT_SECRET=ci-placeholder-jwt-secret-0123456789abcdef/' .env
+          sed -i 's/^TRUSTAGENT_INTERNAL_TOKEN=\r*$/TRUSTAGENT_INTERNAL_TOKEN=ci-placeholder-internal-token-0123456789/' .env
+          sed -i 's/^TRUSTAGENT_DB_PASSWORD=\r*$/TRUSTAGENT_DB_PASSWORD=ci-placeholder/' .env
+          sed -i 's/^TRUSTAGENT_DB_ROOT_PASSWORD=\r*$/TRUSTAGENT_DB_ROOT_PASSWORD=ci-placeholder/' .env
+          sed -i 's/^TRUSTAGENT_REDIS_PASSWORD=\r*$/TRUSTAGENT_REDIS_PASSWORD=ci-placeholder/' .env
+          # 自查：5 个必需变量必须都已被替换，否则后面的 compose 校验失败会指向"语法"，
+          # 而真正的原因（sed 没匹配上）会完全看不出来。
+          for key in TRUSTAGENT_JWT_SECRET TRUSTAGENT_INTERNAL_TOKEN TRUSTAGENT_DB_PASSWORD \
+                     TRUSTAGENT_DB_ROOT_PASSWORD TRUSTAGENT_REDIS_PASSWORD; do
+            if grep -qE "^${key}=\r?$" .env; then
+              echo "${key} 未被填入占位值（sed 未匹配），compose 校验必然失败"
+              exit 1
+            fi
+          done
+          docker compose config -q
+          rm -f .env
+          echo "docker-compose.yml 校验通过"

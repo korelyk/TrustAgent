@@ -1,0 +1,8 @@
+# 运行期依赖（版本锁定，全部为纯 Python/小体积 wheel，不包含任何模型权重）
+fastapi==0.141.1
+uvicorn==0.53.0
+pydantic==2.13.5
+pydantic-settings==2.15.0
+httpx==0.28.1
+redis==8.1.0
+jsonschema==4.26.0

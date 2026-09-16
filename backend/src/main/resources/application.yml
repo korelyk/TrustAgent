@@ -1,0 +1,136 @@
+server:
+  port: ${TRUSTAGENT_SERVER_PORT:8080}
+  # 优雅停机：收到 SIGTERM 后先停止接收新请求、把手上的请求做完再退出。
+  # 对评测链路尤其重要——正在写"结果 + 审计 + 幂等记录"的小事务不该被硬切断。
+  shutdown: graceful
+  tomcat:
+    # Tomcat 工作线程数。默认 200 是按"多并发用户"设计的，
+    # 每个线程都要占栈与 TLAB，在 512 MiB 的容器里是纯粹的浪费。
+    # 演示部署（单用户、低并发）25 足够；这是真实的内存节省项，
+    # 而不是"看起来更谨慎"的摆设。
+    threads:
+      max: ${TRUSTAGENT_TOMCAT_MAX_THREADS:200}
+      min-spare: ${TRUSTAGENT_TOMCAT_MIN_SPARE:10}
+    accept-count: ${TRUSTAGENT_TOMCAT_ACCEPT_COUNT:100}
+    max-connections: ${TRUSTAGENT_TOMCAT_MAX_CONNECTIONS:200}
+
+spring:
+  application:
+    name: trustagent-backend
+  # 不设置 spring.profiles.active：默认即为 MySQL + Redis 的标准部署形态。
+  # 本机零依赖联调用 --spring.profiles.active=dev（H2 + 内存限流/队列）。
+  datasource:
+    url: ${TRUSTAGENT_DB_URL:jdbc:mysql://localhost:3306/trustagent?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC&allowPublicKeyRetrieval=true&useSSL=false}
+    username: ${TRUSTAGENT_DB_USERNAME:trustagent}
+    password: ${TRUSTAGENT_DB_PASSWORD:}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      # 连接池必须能跟着部署形态调小：每条 MySQL 连接在服务端都要占内存
+      # （排序缓冲、临时表等按连接分配），10 条连接在 512 MiB 的 MySQL 上
+      # 是明显的浪费，而低配环境一点余量都很宝贵。
+      # 默认值保持 10（常规部署合适），低配由 docker-compose.lowmem.yml 覆盖为 5。
+      maximum-pool-size: ${TRUSTAGENT_DB_POOL_MAX:10}
+      minimum-idle: ${TRUSTAGENT_DB_POOL_MIN_IDLE:2}
+      connection-timeout: ${TRUSTAGENT_DB_CONNECTION_TIMEOUT_MS:3000}
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+    validate-on-migrate: true
+  data:
+    redis:
+      host: ${TRUSTAGENT_REDIS_HOST:localhost}
+      port: ${TRUSTAGENT_REDIS_PORT:6379}
+      password: ${TRUSTAGENT_REDIS_PASSWORD:}
+      database: ${TRUSTAGENT_REDIS_DATABASE:0}
+      timeout: 2000ms
+  jackson:
+    default-property-inclusion: non_null
+    serialization:
+      write-dates-as-timestamps: false
+  servlet:
+    multipart:
+      # 评测集是 JSONL 纯文本，100 条约 30 KB；10MB 已经是很宽松的上限。
+      # 低配环境会把它进一步调小，避免一次上传把内存顶满。
+      max-file-size: ${TRUSTAGENT_MAX_UPLOAD_SIZE:10MB}
+      max-request-size: ${TRUSTAGENT_MAX_UPLOAD_SIZE:10MB}
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    banner: false
+    db-config:
+      id-type: auto
+      table-underline: true
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: alpha
+
+trustagent:
+  security:
+    # 是否信任反向代理写入的 X-Forwarded-For。**默认 false，不要在有公网直连入口时打开**。
+    #
+    # 关闭（默认）：客户端 IP 取 request.getRemoteAddr()，即 TCP 连接的对端地址，无法被请求头伪造。
+    # 打开：取 XFF 的**最后一段**（由最靠近本机的可信代理追加，比第一段更难伪造），
+    #       并且仅在"所有外部流量都必须经过自己可控的反向代理"时才安全。
+    #
+    # 为什么默认关闭：XFF 是请求头，任何人都能写。无条件信任它等于把登录限流的维度交给调用方——
+    # 攻击者对同一账号每次换一个假的 XFF 就是一个新的限流桶，连打几十次登录失败都不会触发 429。
+    # 开启前请确认：① 应用端口只对反向代理暴露（不直接发布到公网）；
+    #              ② 代理是**追加** XFF 而不是直接覆盖（否则仍可绕过）；
+    #              ③ 代理本身会清洗客户端传入的同名头。投产前用固定 XFF 与变化 XFF 各打一轮验证。
+    trust-forwarded-for: ${TRUSTAGENT_TRUST_FORWARDED_FOR:false}
+  jwt:
+    # 生产必须配置，长度 >= 32 字节。留空时服务会生成进程级随机密钥并打印告警。
+    secret: ${TRUSTAGENT_JWT_SECRET:}
+    issuer: trustagent
+    ttl-seconds: ${TRUSTAGENT_JWT_TTL_SECONDS:7200}
+  internal:
+    # Java <-> Python 的内部凭证；与用户 JWT 完全隔离。
+    token: ${TRUSTAGENT_INTERNAL_TOKEN:}
+    header: X-Internal-Token
+  ai-service:
+    base-url: ${TRUSTAGENT_AI_SERVICE_BASE_URL:http://localhost:8000}
+    connect-timeout-ms: 2000
+    read-timeout-ms: ${TRUSTAGENT_AI_SERVICE_TIMEOUT_MS:20000}
+  rate-limit:
+    # 滑动窗口（Redis ZSET 或内存实现）。见 docs/BENCHMARK.md 与 LEARNING_NOTES.md 的算法说明。
+    enabled: true
+    chat:
+      limit: ${TRUSTAGENT_RL_CHAT_LIMIT:30}
+      window-seconds: 60
+    login:
+      limit: ${TRUSTAGENT_RL_LOGIN_LIMIT:10}
+      window-seconds: 60
+    eval-run:
+      limit: ${TRUSTAGENT_RL_EVAL_LIMIT:10}
+      window-seconds: 60
+  eval:
+    stream-key: eval.jobs
+    dead-letter-key: eval.jobs.dlq
+    consumer-group: cg:eval
+    max-deliveries: ${TRUSTAGENT_EVAL_MAX_DELIVERIES:3}
+    job-timeout-seconds: ${TRUSTAGENT_EVAL_JOB_TIMEOUT_SECONDS:600}
+    # 单个数据集的用例上限。低配环境调小，防止一份超大评测集把
+    # Worker 的内存与 MySQL 的临时表同时顶爆。
+    max-cases-per-dataset: ${TRUSTAGENT_EVAL_MAX_CASES_PER_DATASET:2000}
+  audit:
+    enabled: true
+    detail-max-length: 2000
+  bootstrap:
+    admin-username: ${TRUSTAGENT_BOOTSTRAP_ADMIN_USERNAME:}
+    admin-password: ${TRUSTAGENT_BOOTSTRAP_ADMIN_PASSWORD:}
+  masking:
+    preview-max-length: 1000
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} %-5level traceId=%X{traceId:-none} %logger{36} - %msg%n"
+  level:
+    root: INFO
+    io.trustagent: ${TRUSTAGENT_LOG_LEVEL:INFO}

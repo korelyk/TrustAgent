@@ -1,0 +1,180 @@
+# TrustAgent 一键启动：MySQL 8 + Redis 7 + Java 控制面 + Python 执行面
+#
+# 使用方式：
+#   1) pwsh scripts/init-dev-env.ps1          # 生成 .env（含随机口令）
+#   2) docker compose up -d --build
+#   3) docker compose logs -f backend
+#
+# 本文件与 docker-compose.lowmem.yml 的分工（两者服务名一致，**不要同时启动**）：
+#   本文件              = 开发/联调取向。端口绑 127.0.0.1 方便宿主机直连，不设内存上限。
+#   docker-compose.lowmem.yml = 演示部署取向。显式内存上限、内部服务完全不发布端口、
+#                               镜像必须带明确版本号、日志轮转。**部署到服务器请用那一份。**
+#
+# 几个刻意的设计：
+#   * 包含 web（Caddy）：既提供 Vue 构建产物，也把 /api 反代到控制面。
+#     （早先这里的注释写着"前端尚未实现"，已经过时——前端已完成并在部署中提供。
+#      前端服务用构建后的静态文件，**不是** Vite 开发服务器。）
+#   * 所有口令用 `${VAR:?...}` 引用：未设置就**直接启动失败**，
+#     而不是回退到一个弱默认值。安全项目里"默认不安全"比"启动失败"危险得多。
+#   * 端口只绑定 127.0.0.1：MySQL / Redis / 控制面 / 执行面都不对局域网暴露，
+#     只有 web 是入口。
+#   * 首次 up 会拉取 mysql / redis / python / maven+JDK / caddy 镜像（数 GB）。
+#     这属于需要你主动确认的重操作，仓库不会替你自动执行。
+
+name: trustagent
+
+services:
+
+  mysql:
+    image: mysql:8.4
+    container_name: trustagent-mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: ${TRUSTAGENT_DB_ROOT_PASSWORD:?请在 .env 中设置 TRUSTAGENT_DB_ROOT_PASSWORD（运行 scripts/init-dev-env.ps1 可自动生成）}
+      MYSQL_DATABASE: ${TRUSTAGENT_DB_NAME:-trustagent}
+      MYSQL_USER: ${TRUSTAGENT_DB_USERNAME:?请在 .env 中设置 TRUSTAGENT_DB_USERNAME}
+      MYSQL_PASSWORD: ${TRUSTAGENT_DB_PASSWORD:?请在 .env 中设置 TRUSTAGENT_DB_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./deploy/mysql/conf.d:/etc/mysql/conf.d:ro
+    ports:
+      - "127.0.0.1:3306:3306"
+    healthcheck:
+      # 用**应用账号**ping，而不是 root —— 与 docker-compose.lowmem.yml 保持一致。
+      # 差别是实质性的：root 能 ping 通只证明 mysqld 活着；应用账号能 ping 通
+      # 才同时证明"backend 用它连接是可行的"。用 root 会给出假绿灯——
+      # 表现为容器 healthy、backend 却连不上库（账号/授权/口令配错）。
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u\"$$MYSQL_USER\" -p\"$$MYSQL_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: trustagent-redis
+    environment:
+      REDIS_PASSWORD: ${TRUSTAGENT_REDIS_PASSWORD:?请在 .env 中设置 TRUSTAGENT_REDIS_PASSWORD}
+    # 用 sh -c 把口令从环境变量取出来，避免它出现在 `docker ps` 的 command 列里
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  ai-service:
+    build:
+      context: .
+      dockerfile: deploy/ai-service.Dockerfile
+    container_name: trustagent-ai-service
+    environment:
+      TRUSTAGENT_INTERNAL_TOKEN: ${TRUSTAGENT_INTERNAL_TOKEN:?请在 .env 中设置 TRUSTAGENT_INTERNAL_TOKEN}
+      # 默认 MockLLM：无需任何 API Key。要接真实模型时在 .env 里改这三项
+      TRUSTAGENT_LLM_PROVIDER: ${TRUSTAGENT_LLM_PROVIDER:-mock}
+      TRUSTAGENT_LLM_MODEL: ${TRUSTAGENT_LLM_MODEL:-mock-llm-v1}
+      TRUSTAGENT_OPENAI_BASE_URL: ${TRUSTAGENT_OPENAI_BASE_URL:-}
+      TRUSTAGENT_OPENAI_API_KEY: ${TRUSTAGENT_OPENAI_API_KEY:-}
+      # 容器内用服务名互访，不能用 localhost
+      TRUSTAGENT_JAVA_BASE_URL: http://backend:8080
+      TRUSTAGENT_REDIS_URL: redis://:${TRUSTAGENT_REDIS_PASSWORD}@redis:6379/0
+      TRUSTAGENT_EVAL_WORKER_ENABLED: ${TRUSTAGENT_EVAL_WORKER_ENABLED:-true}
+      TRUSTAGENT_LOG_LEVEL: ${TRUSTAGENT_LOG_LEVEL:-INFO}
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 15s
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: deploy/backend.Dockerfile
+    container_name: trustagent-backend
+    environment:
+      TRUSTAGENT_DB_URL: "jdbc:mysql://mysql:3306/${TRUSTAGENT_DB_NAME:-trustagent}?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC&allowPublicKeyRetrieval=true&useSSL=false"
+      TRUSTAGENT_DB_USERNAME: ${TRUSTAGENT_DB_USERNAME:?请在 .env 中设置 TRUSTAGENT_DB_USERNAME}
+      TRUSTAGENT_DB_PASSWORD: ${TRUSTAGENT_DB_PASSWORD:?请在 .env 中设置 TRUSTAGENT_DB_PASSWORD}
+      TRUSTAGENT_REDIS_HOST: redis
+      TRUSTAGENT_REDIS_PORT: "6379"
+      TRUSTAGENT_REDIS_PASSWORD: ${TRUSTAGENT_REDIS_PASSWORD:?请在 .env 中设置 TRUSTAGENT_REDIS_PASSWORD}
+      TRUSTAGENT_JWT_SECRET: ${TRUSTAGENT_JWT_SECRET:?请在 .env 中设置 TRUSTAGENT_JWT_SECRET（长度需 >= 32 字节）}
+      TRUSTAGENT_INTERNAL_TOKEN: ${TRUSTAGENT_INTERNAL_TOKEN:?请在 .env 中设置 TRUSTAGENT_INTERNAL_TOKEN}
+      TRUSTAGENT_AI_SERVICE_BASE_URL: http://ai-service:8000
+      TRUSTAGENT_AI_SERVICE_TIMEOUT_MS: ${TRUSTAGENT_AI_SERVICE_TIMEOUT_MS:-20000}
+      TRUSTAGENT_BOOTSTRAP_ADMIN_USERNAME: ${TRUSTAGENT_BOOTSTRAP_ADMIN_USERNAME:-}
+      TRUSTAGENT_BOOTSTRAP_ADMIN_PASSWORD: ${TRUSTAGENT_BOOTSTRAP_ADMIN_PASSWORD:-}
+      TRUSTAGENT_LOG_LEVEL: ${TRUSTAGENT_LOG_LEVEL:-INFO}
+      # 固定时区，避免"评测耗时差 8 小时"这类只在外网复现的问题
+      TZ: UTC
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ai-service:
+        condition: service_started
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 前端 + 反向代理
+  #
+  # 这是唯一对外的入口。Caddy 同时做两件事：
+  #   * 提供 web/dist 里的 Vue 构建产物（**不是** Vite 开发服务器）
+  #   * 把 /api/* 反代到 backend，并在入口处拒绝 /internal/**
+  # ---------------------------------------------------------------------------
+  web:
+    build:
+      context: .
+      dockerfile: deploy/web.Dockerfile
+    # 开发取向：允许用默认 tag，便于反复重建。
+    # 部署取向（lowmem）**要求显式 tag**，见 docker-compose.lowmem.yml 的说明。
+    image: trustagent-web:${TRUSTAGENT_IMAGE_TAG:-dev}
+    container_name: trustagent-web
+    # 与 docker-compose.lowmem.yml 保持一致：deploy/Caddyfile.public 会用这两个变量做
+    # {$VAR} 环境变量插值，缺失时 Caddy 会因站点块缺主机名而启动失败。
+    # 私有模式（默认挂载 Caddyfile.private）不使用它们，留空即可。
+    environment:
+      TRUSTAGENT_PUBLIC_DOMAIN: ${TRUSTAGENT_PUBLIC_DOMAIN:-}
+      TRUSTAGENT_ACME_EMAIL: ${TRUSTAGENT_ACME_EMAIL:-}
+    volumes:
+      # 只读挂载代理配置；切换私有/公网模式只改挂载的文件，不需要重建镜像
+      - ./deploy/Caddyfile.private:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "127.0.0.1:${TRUSTAGENT_WEB_PORT:-8090}:8080"
+    depends_on:
+      backend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  redis-data:
+  caddy-data:
+  caddy-config:

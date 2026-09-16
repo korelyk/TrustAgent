@@ -1,0 +1,95 @@
+# ============================================================================
+# 换行与二进制约定
+#
+# 为什么需要这个文件：
+#   这个仓库在 Windows 上编辑、在 **Linux 上执行**（CI 跑在 ubuntu-latest，
+#   服务器脚本也是 bash）。同一份文件在两侧对行尾的容忍度完全不同：
+#
+#   * shell 脚本带 CRLF 时，解释器会把 \r 当成行内容的一部分：
+#     `set -euo pipefail\r` 会报 "invalid option name"，
+#     `#!/usr/bin/env bash\r` 会让内核找不到解释器。
+#   * sed/grep 按行匹配时，`\r` 会让 `$` 锚点对不上（例如 `s/^KEY=$/`
+#     永远匹配不到 CRLF 文件里的 `KEY=`，这正是 CI 的 compose 校验曾经
+#     必然失败的原因）。
+#   * 反过来，Windows PowerShell 5.1 读**无 BOM** 的 UTF-8 中文会乱码，
+#     所以 .ps1 不能强制成 LF —— 它在本机执行，保持 CRLF、BOM 由写入方保证。
+#
+# 规则顺序：先写通用默认，再写例外；git 以**最后一个匹配的规则**为准。
+# ============================================================================
+
+# ---- 默认：由 git 判定哪些是文本文件（入库统一 LF），检出时跟随平台 ----
+#
+# 为什么默认**不**写 eol=lf：
+#   本项目的开发机是 Windows（.py / .java / .vue 在 IDE 里编辑），执行环境是 Linux。
+#   对 "行尾不影响执行" 的源码文件，强制检出为 LF 只会让 IDE 每次保存都产生
+#   一个"整个文件都改了"的 diff，收益为零。
+#   真正需要强制 LF 的是**会被 Linux 工具链逐行解析**的文件（shell、YAML、
+#   Dockerfile、Makefile、.env、SQL 迁移 等），它们在下方的显式规则里逐个列出。
+#
+#   git 以**最后一个匹配的规则**为准 —— 显式规则写在默认之后，
+#   因此放宽默认不会放松任何执行侧约束。
+* text=auto
+
+# ---- 例外：Windows 原生脚本保持 CRLF ----
+# .ps1 在 Windows PowerShell 上执行，且现网脚本是 CRLF（多数还带 UTF-8 BOM）的约定。
+# 强制 LF 没有收益，反而会让 PowerShell 5.1 的中文输出更容易出问题。
+*.ps1  text eol=crlf
+*.psm1 text eol=crlf
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+
+# ---- 明确需要 LF 的执行侧文件（与上面默认一致，写出来是为了可读与防误改）----
+*.sh          text eol=lf
+*.bash        text eol=lf
+mvnw          text eol=lf
+Makefile      text eol=lf
+makefile      text eol=lf
+GNUmakefile   text eol=lf
+
+# ---- CI / 编排 / 容器配置：Linux 侧解析，必须是 LF ----
+*.yml         text eol=lf
+*.yaml        text eol=lf
+Dockerfile    text eol=lf
+*.Dockerfile  text eol=lf
+*.dockerfile  text eol=lf
+
+# ---- 会被 sed/grep/dotenv 逐行解析的配置模板 ----
+*.example     text eol=lf
+*.env         text eol=lf
+.env          text eol=lf
+*.conf        text eol=lf
+*.cnf         text eol=lf
+*.ini         text eol=lf
+*.properties  text eol=lf
+*.sql         text eol=lf
+# JSONL 评测集必须是 LF：datasets/synthetic_eval_v1.jsonl 的 SHA256 被
+# docs/BENCHMARK.md 与 datasets/README.md **冻结**（600d0988…）。
+# 若检出时被转成 CRLF，新克隆的仓库里那个哈希就对不上了 ——
+# 而"哈希对不上"会让整份基准数字看起来不可信（这正是它要防的事）。
+*.jsonl       text eol=lf
+deploy/Caddyfile.private text eol=lf
+deploy/Caddyfile.public  text eol=lf
+
+# ---- 纯文档 ----
+*.md          text eol=lf
+# .gitattributes 自己也要 LF：本机 core.autocrlf 会把没有显式规则的文件检出成 CRLF，
+# 让这个文件在每次 checkout 后都显示为"已修改"。
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+.dockerignore  text eol=lf
+
+# ---- 二进制：绝不做行尾转换 ----
+*.jar   binary
+*.tar   binary
+*.gz    binary
+*.zip   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.pdf   binary
+*.db    binary
+*.xlsx  binary

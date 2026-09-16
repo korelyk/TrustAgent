@@ -1,0 +1,206 @@
+# ============================================================================
+# CI：构建发布产物（**只能手动触发**）
+#
+# 为什么不配 push 触发：
+#   本项目的镜像与 jar 会直接用于演示部署。自动构建 + 自动发布意味着
+#   "任何一次提交都可能悄悄改变线上跑的东西"，而出问题时没人知道
+#   到底是哪一版。这里刻意做成 workflow_dispatch：
+#   **是否构建、构建哪一版、要不要上传产物，都由人明确决定。**
+#
+# 刻意不做的事：
+#   * 不推送到任何镜像仓库（push: false）—— 产物留在 Actions artifact 里，
+#     需要时人工下载。发布镜像需要独立的、显式的授权。
+#   * 不部署到任何服务器。部署步骤见 docs/DEPLOYMENT.md，需人工执行。
+#   * 不跑 k6 压测、不跑 100 条批量评测（那些需要真实环境且会消耗资源）。
+#
+# 用法：在 GitHub 仓库页面 Actions -> Build release artifacts -> Run workflow。
+# ============================================================================
+
+name: Build release artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '版本号（例如 v0.1.0-demo1）。留空则按运行编号生成。不能是 latest。'
+        required: false
+        default: ''
+      run_tests:
+        description: '构建前先跑单元/集成测试'
+        type: boolean
+        required: false
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 计算版本号
+        id: version
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="v0.1.0-ci${{ github.run_number }}"
+          fi
+          if [ "$TAG" = "latest" ]; then
+            echo "::error::版本号不允许为 latest"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "使用版本号: $TAG"
+
+      # ---------------------------------------------------------------------
+      # Java 控制面
+      # ---------------------------------------------------------------------
+      - name: 准备 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Java 测试（H2 内存库，无需 MySQL/Redis）
+        if: ${{ inputs.run_tests }}
+        working-directory: backend
+        run: ./mvnw -B test
+
+      - name: Java 打包
+        working-directory: backend
+        run: ./mvnw -B -DskipTests package
+
+      # ---------------------------------------------------------------------
+      # 前端
+      # ---------------------------------------------------------------------
+      - name: 准备 Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 前端构建
+        working-directory: web
+        env:
+          # 与本地构建保持一致的内存上限
+          NODE_OPTIONS: --max-old-space-size=2048
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      # ---------------------------------------------------------------------
+      # Python 执行面
+      # ---------------------------------------------------------------------
+      - name: 准备 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python 依赖
+        working-directory: ai-service
+        run: pip install -r requirements.txt
+
+      - name: Python 测试（确定性 MockLLM，不调用任何外部模型）
+        if: ${{ inputs.run_tests }}
+        working-directory: ai-service
+        run: python -m pytest -q
+
+      # ---------------------------------------------------------------------
+      # 同步 jar 到 deploy/artifacts/（backend 镜像的输入）
+      # ---------------------------------------------------------------------
+      # 为什么必须有这一步：服务器部署用的 deploy/backend-runtime.Dockerfile
+      # 是 `COPY deploy/artifacts/trustagent-backend-0.1.0.jar`（服务器上不跑 Maven）。
+      # 本 workflow 以前只跑 `mvn package`、从不刷新 deploy/artifacts/，
+      # 于是要么构建失败（库里没有该 jar）、要么装进镜像的是仓库里那份旧产物 ——
+      # 后者更糟：构建一路绿灯，服务器上跑的却是旧代码。
+      # scripts/build-release.ps1 里有同样的步骤，两边必须保持一致。
+      - name: 同步 jar 到 deploy/artifacts/
+        run: |
+          set -e
+          mkdir -p deploy/artifacts
+          rm -f deploy/artifacts/trustagent-backend-*.jar
+          cp backend/target/trustagent-backend-0.1.0.jar deploy/artifacts/
+          # 回读校验：只打印"已复制"不算验证
+          src=$(sha256sum backend/target/trustagent-backend-0.1.0.jar | cut -d' ' -f1)
+          dst=$(sha256sum deploy/artifacts/trustagent-backend-0.1.0.jar | cut -d' ' -f1)
+          if [ "$src" != "$dst" ]; then
+            echo "::error::jar 复制后校验值不一致（src=$src dst=$dst）"
+            exit 1
+          fi
+          echo "jar 已同步: deploy/artifacts/trustagent-backend-0.1.0.jar ($src)"
+
+      # ---------------------------------------------------------------------
+      # 镜像
+      # ---------------------------------------------------------------------
+      # backend 用「只组装、不编译」的 Dockerfile：必须与
+      # docker-compose.lowmem.yml（服务器部署编排）指向同一个文件，
+      # 否则 CI 产出的镜像 ≠ 服务器实际运行的镜像。
+      - name: 构建镜像（只构建，不推送）
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          docker build -f deploy/backend-runtime.Dockerfile -t "trustagent-backend:$TAG"    .
+          docker build -f deploy/ai-service.Dockerfile      -t "trustagent-ai-service:$TAG" .
+          docker build -f deploy/web.Dockerfile             -t "trustagent-web:$TAG"        .
+
+      # 校验镜像的端口暴露面。低配编排依赖"容器不在宿主机上监听端口"这一属性，
+      # 而 Dockerfile 里的 EXPOSE 只是文档，这里确认它没有变成实际发布。
+      - name: 检查镜像元信息
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          for img in trustagent-backend trustagent-ai-service trustagent-web; do
+            echo "=== ${img}:${TAG} ==="
+            docker image inspect "${img}:${TAG}" --format 'created={{.Created}} size={{.Size}}'
+            docker image inspect "${img}:${TAG}" --format '{{json .Config.ExposedPorts}}'
+          done
+
+      - name: 导出镜像 tar
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          mkdir -p deploy/images
+          for img in trustagent-backend trustagent-ai-service trustagent-web; do
+            docker save -o "deploy/images/${img}-${TAG}.tar" "${img}:${TAG}"
+          done
+          cd deploy/images
+          sha256sum *-"${TAG}".tar > "SHA256SUMS-${TAG}.txt"
+          cat "SHA256SUMS-${TAG}.txt"
+
+      - name: 上传产物（保留 7 天，不发布到任何镜像仓库）
+        uses: actions/upload-artifact@v4
+        with:
+          name: trustagent-images-${{ steps.version.outputs.tag }}
+          path: deploy/images/*-${{ steps.version.outputs.tag }}.tar
+          retention-days: 7
+
+      - name: 上传校验值
+        uses: actions/upload-artifact@v4
+        with:
+          name: trustagent-checksums-${{ steps.version.outputs.tag }}
+          path: deploy/images/SHA256SUMS-${{ steps.version.outputs.tag }}.txt
+          retention-days: 30
+
+      - name: 摘要
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          {
+            echo "## 构建完成"
+            echo ""
+            echo "- 版本号: \`$TAG\`"
+            echo "- 产物: trustagent-backend / ai-service / web 三个镜像 tar"
+            echo ""
+            echo "### 部署方式（需人工执行）"
+            echo '```bash'
+            echo "# 1. 下载 artifact 并上传到服务器"
+            echo "scp deploy/images/*-$TAG.tar <user>@<server>:/opt/trustagent/deploy/images/"
+            echo "# 2. 服务器 .env 中设置 TRUSTAGENT_IMAGE_TAG=$TAG"
+            echo "# 3. 服务器上执行"
+            echo "./scripts/server/preflight.sh"
+            echo "./scripts/server/deploy.sh"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

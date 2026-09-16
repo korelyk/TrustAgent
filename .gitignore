@@ -1,0 +1,92 @@
+# ============================================================================
+# TrustAgent
+# 原则：只提交"人写的东西"。编译产物、依赖缓存、本机数据一律不入库。
+# ============================================================================
+
+# ---------- Java 构建产物 ----------
+target/
+build/
+out/
+*.class
+*.jar
+*.war
+!.mvn/wrapper/maven-wrapper.jar
+
+# ---------- 本机工具链缓存 ----------
+# 这些目录刻意放在项目内（而不是 C 盘用户目录），因此必须显式忽略：
+# 其中 Maven 本地仓库可达上百 MB，一旦误提交会永久留在 Git 历史里。
+.local/
+.m2/
+.mvn/maven.config
+
+# ---------- 前端 ----------
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+
+# ---------- Python ----------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------- 运行期本地数据 ----------
+# backend dev profile 的 H2 文件、ai-service 的 Mock Outbox、任何本地日志
+.data/
+*.log
+logs/
+tmp/
+outbox/
+
+# 发布产物：docker save 出来的镜像 tar 可达数 GB，绝不能进版本库。
+# 它们由 scripts/build-release.ps1 在本地生成、用 scp 上传到服务器，
+# 不走 Git —— 走 Git 会把仓库撑到无法克隆。
+deploy/images/
+
+# 发布产物：由 scripts/build-release.ps1 从 backend/target/ 同步过来的 backend jar。
+# 它是**构建产物**（一份 50 MB 的二进制），不该入库；
+# 但 .dockerignore 里**不能**排除它 —— deploy/backend-runtime.Dockerfile 要 COPY 它
+# 进镜像（见 .dockerignore 的说明）。
+deploy/artifacts/*.jar
+
+# ---------- 敏感配置 ----------
+# 只允许提交 .env.example；真实密钥永远留在环境变量或未入库的 .env 里
+.env
+.env.*
+!.env.example
+**/application-local.yml
+**/application-secret.yml
+
+# ---------- 防御：环境变量未展开产生的字面量目录 ----------
+# 例如某些命令把 %SystemDrive% 当作目录名写到项目根下，
+# 生成 %SystemDrive%/ProgramData/Microsoft/Windows/Caches/*.db 这类系统缓存。
+# 用 **/ 而不是 /：这类垃圾可能出现在任意子目录（实测 ai-service/ 下也出现过一份），
+# 只锚定根目录的规则会漏掉它。
+**/%SystemDrive%/
+**/%ProgramData%/
+**/%LOCALAPPDATA%/
+**/%TEMP%/
+
+# 本机临时验证产物：我用 _xxx.txt / _xxx.log 这种前缀写诊断输出，
+# 它们散落在 ai-service/ 等目录下，不应进版本库。
+# （正式日志走 .local/ 与 *.log 规则，这里只是补上前缀约定。）
+_*.txt
+_*.log
+_*.ps1
+
+# ---------- 编辑器 / IDE ----------
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+Thumbs.db

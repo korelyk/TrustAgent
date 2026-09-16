@@ -1,0 +1,45 @@
+# 单元测试 / 集成测试 profile：内存 H2 + 内存限流 + 内存评测队列，不依赖任何外部服务。
+# 这里的 jwt.secret / internal.token 是测试专用固定值，不是任何真实环境的凭证。
+spring:
+  datasource:
+    url: jdbc:h2:mem:trustagent_test;MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE;DB_CLOSE_DELAY=-1
+    username: sa
+    password: ""
+    driver-class-name: org.h2.Driver
+  flyway:
+    enabled: true
+    clean-disabled: false
+
+trustagent:
+  runtime:
+    infrastructure: memory
+  jwt:
+    secret: test-only-jwt-secret-please-do-not-use-in-production-0123456789
+    ttl-seconds: 3600
+  internal:
+    token: test-only-internal-token-0123456789
+  ai-service:
+    base-url: http://localhost:1
+    connect-timeout-ms: 500
+    read-timeout-ms: 1000
+  rate-limit:
+    chat:
+      limit: 5
+      window-seconds: 60
+    login:
+      limit: 10
+      window-seconds: 60
+    # eval-run 的额度调大：多个测试场景都会"建任务"，
+    # 如果沿用 3 次/分钟的默认值，测试之间会互相把额度打光，表现为随机的 429（与被测逻辑无关）。
+    # 限流本身的正确性由 AuthSecurityTest 针对登录接口验证（那里用独立用户名 + 清空窗口）。
+    eval-run:
+      limit: 30
+      window-seconds: 60
+  bootstrap:
+    admin-username: ""
+    admin-password: ""
+
+logging:
+  level:
+    root: WARN
+    io.trustagent: INFO

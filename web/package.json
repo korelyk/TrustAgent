@@ -1,0 +1,27 @@
+{
+  "name": "trustagent-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "TrustAgent 管理端：登录、应用与策略管理、Agent Playground、评测、Trace、安全事件、审计链验证",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit -p tsconfig.json && vite build",
+    "build:only": "vite build",
+    "preview": "vite preview --port 4173"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "element-plus": "^2.9.1",
+    "pinia": "^3.0.1",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.7",
+    "vue-tsc": "^2.2.0"
+  }
+}
